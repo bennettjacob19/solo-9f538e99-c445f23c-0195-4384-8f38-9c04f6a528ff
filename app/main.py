@@ -146,7 +146,7 @@ def api_points() -> dict:
 
 @app.get("/api/directory")
 def api_directory(point: str) -> JSONResponse:
-    """按提交点（LSN，如 0/16B3748）查看该时刻的整张目录。"""
+    """按提交点（LSN，如 0/16B3748）查看该时刻的整张目录（保留原回溯视图）。"""
     _require_ready()
     try:
         lsn_num = lsn_to_num(point)
@@ -168,9 +168,47 @@ def api_directory(point: str) -> JSONResponse:
     )
 
 
+@app.get("/api/verify")
+def api_verify(point: str | None = None) -> JSONResponse:
+    """网页核验：以同一历史视图复算哈希链，核验截止该提交点的记录。
+
+    - 不传 point 时核验到最新提交点；
+    - 发现缺行/改值/乱序时，status=INVALID 并给出封存起点或最早失效事务
+      （first_invalid_seq/reason/detail），受影响的回溯行 trust=UNTRUSTED；
+    - 链完好时启用后封存覆盖的行 trust=TRUSTED；早于封存起点的旧记录
+      trust=UNKNOWN（启用前真实性未知，不代表被篡改）。
+    核验只读，不影响捕获线程继续落盘。
+    """
+    _require_ready()
+    points = store.get_points()
+    valid_nums = {p["lsn_num"] for p in points}
+    if point is None:
+        lsn_num = max(p["lsn_num"] for p in points)
+        point = next(p["lsn"] for p in points if p["lsn_num"] == lsn_num)
+    else:
+        try:
+            lsn_num = lsn_to_num(point)
+        except (ValueError, IndexError):
+            raise HTTPException(
+                status_code=400, detail="point 必须是 LSN，形如 0/16B3748"
+            )
+        if lsn_num not in valid_nums:
+            raise HTTPException(
+                status_code=404,
+                detail="该 LSN 不是已捕获的提交点，请先在 /api/points 中选择",
+            )
+    result = store.verify_at(lsn_num)
+    result["point"] = point
+    return JSONResponse(result)
+
+
 @app.get("/api/history/{artifact_no}")
 def api_artifact_history(artifact_no: int) -> dict:
-    """单个制品编号的完整变更链；删除后重用编号，旧历史也全部保留。"""
+    """单个制品编号的完整变更链；删除后重用编号，旧历史也全部保留。
+
+    每行带 trust：TRUSTED（封存验证通过）/ UNTRUSTED（链失效点及之后）/
+    UNKNOWN（早于封存启用，真实性未知）。
+    """
     _require_ready()
     return {
         "artifact_no": artifact_no,

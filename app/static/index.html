@@ -38,12 +38,24 @@
   .tag.DELETE { color:var(--err); border-color:var(--err); }
   .tag.INSERT, .tag.BASELINE { color:var(--ok); border-color:var(--ok); }
   .tag.UPDATE { color:#0969da; border-color:#0969da; }
+  .trust { font-size:11px; padding:1px 7px; border-radius:999px; font-weight:700; white-space:nowrap; }
+  .trust.TRUSTED { background:#dafbe1; color:var(--ok); border:1px solid var(--ok); }
+  .trust.UNTRUSTED { background:#ffebe9; color:var(--err); border:1px solid var(--err); }
+  .trust.UNKNOWN { background:#fff8c5; color:var(--warn); border:1px solid var(--warn); }
+  .verdict { border-radius:8px; padding:12px 14px; margin-bottom:10px; font-size:13px; }
+  .verdict.VERIFIED { background:#dafbe1; border:1px solid var(--ok); }
+  .verdict.INVALID { background:#ffebe9; border:1px solid var(--err); }
+  .verdict h3 { margin:0 0 6px; font-size:14px; }
+  .verdict code { background:rgba(0,0,0,.06); }
+  .seal-ok { color:var(--ok); font-weight:700; }
+  .seal-bad { color:var(--err); font-weight:700; }
+  .seal-off { color:var(--warn); font-weight:700; }
 </style>
 </head>
 <body>
 <header>
-  <h1>制品目录历史查询（PostgreSQL 逻辑复制 → SQLite 仅增日志）</h1>
-  <div class="sub">先落盘、后确认槽位 · 多行事务整体可见 · 删除后重用编号保留旧历史</div>
+  <h1>制品目录历史查询（PostgreSQL 逻辑复制 → SQLite 仅增日志 + 链式封存核验）</h1>
+  <div class="sub">先落盘、后确认槽位 · 每笔事务链式 SHA-256 封存 · 缺行/改值/乱序可核验 · 删除后重用编号保留旧历史</div>
 </header>
 <main>
   <section class="card">
@@ -65,11 +77,12 @@
   </section>
 
   <section class="card full">
-    <h2>③ 选择提交点查看旧值（点击一行 = 查看该点整目录）</h2>
+    <h2>③ 选择提交点：回看旧值 / 封存核验（缺行·改值·乱序）</h2>
     <table>
-      <thead><tr><th>类型</th><th>提交点 LSN</th><th>源事务 xid</th><th>提交时间</th><th>变更行数</th></tr></thead>
-      <tbody id="points"><tr><td colspan="5" class="muted">加载中…</td></tr></tbody>
+      <thead><tr><th>类型</th><th>提交点 LSN</th><th>源事务 xid</th><th>提交时间</th><th>变更行数</th><th>封存序号</th><th>操作</th></tr></thead>
+      <tbody id="points"><tr><td colspan="7" class="muted">加载中…</td></tr></tbody>
     </table>
+    <div id="verify-wrap" style="margin-top:14px;"></div>
     <div id="dir-wrap" style="margin-top:14px;"></div>
   </section>
 
@@ -101,6 +114,11 @@ async function getJSON(url, opts){
 async function refreshProgress(){
   try {
     const p = await getJSON('/api/progress');
+    const s = p.seal || {};
+    let sealState;
+    if (!s.enabled) sealState = '<span class="seal-off">未启用</span>';
+    else if (s.link_ok) sealState = '<span class="seal-ok">链完好</span>';
+    else sealState = '<span class="seal-bad">链异常（请核验）</span>';
     document.getElementById('progress').innerHTML = `
       <div>状态</div><div><span class="badge ${esc(p.phase)}">${esc(p.phase)}</span></div>
       <div>复制槽</div><div><code>${esc(p.slot_name ?? '-')}</code></div>
@@ -109,6 +127,8 @@ async function refreshProgress(){
       <div>最近流消息 LSN</div><div><code>${esc(p.last_message_lsn ?? '-')}</code></div>
       <div>已捕获事务数</div><div>${p.captured_transactions ?? 0}</div>
       <div>历史日志行数</div><div>${p.history_rows ?? 0}</div>
+      <div>封存链</div><div>${sealState} · 封存记录 ${s.seal_count ?? 0} 条
+        <div class="muted">起点 <code>${esc(s.genesis_lsn ?? '-')}</code>${s.legacy_upgrade ? '（旧库首次启用：启用前真实性未知）' : ''}</div></div>
       <div>最近错误</div><div>${p.last_error ? '<span style="color:var(--err)">'+esc(p.last_error)+'</span>' : '无'}</div>`;
   } catch(e){ document.getElementById('progress').innerHTML = '<div class="msg err">'+esc(e.message)+'</div>'; }
 }
@@ -168,18 +188,58 @@ async function refreshPoints(){
   try {
     const r = await getJSON('/api/points');
     pointsCache = r.points;
-    if (!r.points.length) { tb.innerHTML='<tr><td colspan="5" class="muted">暂无提交点</td></tr>'; return; }
+    if (!r.points.length) { tb.innerHTML='<tr><td colspan="7" class="muted">暂无提交点</td></tr>'; return; }
     tb.innerHTML = r.points.map(p => `
-      <tr class="point-row" onclick="viewDirectory('${esc(p.lsn)}')">
-        <td><span class="tag ${p.kind}">${esc(p.kind)}</span></td>
-        <td><code>${esc(p.lsn)}</code></td>
-        <td>${p.xid ?? '—'}</td>
-        <td>${esc(p.commit_ts ?? '—')}</td>
-        <td>${p.change_count}</td>
+      <tr class="point-row">
+        <td onclick="viewDirectory('${esc(p.lsn)}')"><span class="tag ${p.kind}">${esc(p.kind)}</span></td>
+        <td onclick="viewDirectory('${esc(p.lsn)}')"><code>${esc(p.lsn)}</code></td>
+        <td onclick="viewDirectory('${esc(p.lsn)}')">${p.xid ?? '—'}</td>
+        <td onclick="viewDirectory('${esc(p.lsn)}')">${esc(p.commit_ts ?? '—')}</td>
+        <td onclick="viewDirectory('${esc(p.lsn)}')">${p.change_count}</td>
+        <td onclick="viewDirectory('${esc(p.lsn)}')">${p.seal_seq ?? '—'}</td>
+        <td style="white-space:nowrap;">
+          <button onclick="viewDirectory('${esc(p.lsn)}')">回看目录</button>
+          <button class="primary" onclick="verifyPoint('${esc(p.lsn)}')">核验到此点</button>
+        </td>
       </tr>`).join('');
   } catch(e){
-    tb.innerHTML = `<tr><td colspan="5" class="msg err">${esc(e.status===503 ? '初始化未完成，历史暂不开放' : e.message)}</td></tr>`;
+    tb.innerHTML = `<tr><td colspan="7" class="msg err">${esc(e.status===503 ? '初始化未完成，历史暂不开放' : e.message)}</td></tr>`;
   }
+}
+
+const TRUST_TEXT = {TRUSTED:'可信', UNTRUSTED:'不可信', UNKNOWN:'真实性未知'};
+
+async function verifyPoint(lsn){
+  const wrap = document.getElementById('verify-wrap');
+  wrap.innerHTML = '<div class="muted">正在复算链式 SHA-256 摘要…</div>';
+  try {
+    const r = await getJSON('/api/verify?point='+encodeURIComponent(lsn));
+    const g = r.seal_genesis || {};
+    let banner;
+    if (r.status === 'VERIFIED') {
+      banner = `<div class="verdict VERIFIED"><h3>✔ 核验通过（截止提交点 <code>${esc(lsn)}</code>）</h3>
+        已复算 ${r.checked_seals} 条封存（含封存起点 seq=0），未发现缺行、改值或乱序。
+        启用封存之后的记录可信；封存起点（<code>${esc(g.commit_lsn ?? '-')}</code>${g.legacy_upgrade?'，旧库首次启用':''}）
+        之前的旧记录真实性标为“未知”，仅证明启用封存后未被改动。</div>`;
+    } else {
+      banner = `<div class="verdict INVALID"><h3>✘ 核验失败：封存链已被破坏（截止提交点 <code>${esc(lsn)}</code>）</h3>
+        最早失效封存 seq=<code>${esc(r.first_invalid_seq)}</code>（${esc(r.first_invalid_reason)}）<br>
+        ${esc(r.first_invalid_detail ?? '')}<br>
+        封存起点：<code>${esc(g.commit_lsn ?? '-')}</code>（${g.legacy_upgrade?'旧库首次启用封存':'随基线启用封存'}）；
+        seq ≥ ${esc(r.first_invalid_seq)} 的回溯结果一律标为<span class="trust UNTRUSTED">不可信</span>，
+        seq ≤ ${esc(r.last_good_seq ?? 'none')} 已独立验证通过。</div>`;
+    }
+    const rows = r.artifacts;
+    wrap.innerHTML = banner + `
+      <h3 style="font-size:14px;margin:6px 0;">截止 <code>${esc(lsn)}</code> 的核验后目录（${rows.length} 行）</h3>
+      <table><thead><tr><th>制品编号</th><th>服务名</th><th>版本</th><th>SHA-256</th><th>来源</th><th>可信性</th></tr></thead>
+      <tbody>${rows.map(a=>`<tr><td>${a.artifact_no}</td><td>${esc(a.service_name)}</td>
+        <td>${esc(a.version)}</td><td><code>${esc(a.sha256)}</code></td>
+        <td><span class="tag ${esc(a.change_type)}">${esc(a.change_type)}</span></td>
+        <td><span class="trust ${esc(a.trust)}" title="封存序号 ${a.seal_seq ?? '无（早于封存）'}">${TRUST_TEXT[a.trust] || esc(a.trust)}</span></td></tr>`).join('')
+        || '<tr><td colspan="6" class="muted">该时刻目录为空</td></tr>'}</tbody></table>
+      <div class="muted" style="margin-top:6px;">核验为只读操作，捕获线程仍在继续落盘，不影响复制槽确认。</div>`;
+  } catch(e){ wrap.innerHTML = '<div class="verdict INVALID"><h3>核验请求失败</h3>'+esc(e.message)+'</div>'; }
 }
 
 async function viewDirectory(lsn){
@@ -203,12 +263,15 @@ async function loadHistory(){
     const r = await getJSON('/api/history/'+no);
     if (!r.history.length) { wrap.innerHTML='<div class="muted">该编号没有任何历史记录</div>'; return; }
     wrap.innerHTML = `<table><thead><tr><th>顺序</th><th>变更</th><th>服务名</th><th>版本</th><th>SHA-256</th>
-      <th>xid</th><th>提交点 LSN</th><th>捕获时间</th></tr></thead><tbody>
+      <th>xid</th><th>提交点 LSN</th><th>封存序号</th><th>可信性</th><th>捕获时间</th></tr></thead><tbody>
       ${r.history.map((h,i)=>`<tr><td>${i+1}</td><td><span class="tag ${esc(h.change_type)}">${esc(h.change_type)}</span></td>
         <td>${esc(h.service_name ?? '—')}</td><td>${esc(h.version ?? '—')}</td>
         <td><code>${esc(h.sha256 ?? '—')}</code></td><td>${h.xid ?? '—'}</td>
-        <td><code>${esc(h.commit_lsn ?? '—')}</code></td><td class="muted">${esc(h.captured_at)}</td></tr>`).join('')}
-      </tbody></table>`;
+        <td><code>${esc(h.commit_lsn ?? '—')}</code></td><td>${h.seal_seq ?? '—'}</td>
+        <td><span class="trust ${esc(h.trust)}">${TRUST_TEXT[h.trust] || esc(h.trust)}</span></td>
+        <td class="muted">${esc(h.captured_at)}</td></tr>`).join('')}
+      </tbody></table>
+      <div class="muted" style="margin-top:6px;">可信：封存复算通过；不可信：封存链失效点及之后；未知：早于封存启用，启用前真实性无法证明。</div>`;
   } catch(e){ wrap.innerHTML='<div class="msg err">'+esc(e.message)+'</div>'; }
 }
 

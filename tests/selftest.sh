@@ -274,6 +274,182 @@ echo "=== 7. 两侧持久化 ==="
 [ -f "$SQLDIR/history.db" ] && ok "SQLite 历史库落盘: $SQLDIR/history.db" || bad "SQLite 未落盘"
 [ -d "$PGDATA/pg_wal" ] && ok "PostgreSQL 数据目录持久化: $PGDATA" || bad "PG 数据目录缺失"
 
+# ------------------------------------------------------------- 8. 连续封存与网页核验
+echo "=== 8. 链式 SHA-256 封存与核验 ==="
+# 8.1 每个提交点都带封存序号，进度接口暴露封存链且轻量链接完好
+seal_n=$(api /api/progress | jq -r '.seal.seal_count')
+[ "$seal_n" -ge 2 ] && ok "封存记录随基线+每笔事务生成（$seal_n 条）" || bad "封存数量异常: $seal_n"
+check "$(api /api/progress | jq -r '.seal.enabled')" "true" "封存已启用"
+check "$(api /api/progress | jq -r '.seal.link_ok')" "true" "封存链链接完好"
+nopts=$(api /api/points | jq '[.points[]|select(.seal_seq!=null)]|length')
+nall=$(api /api/points | jq '.points|length')
+check "$nopts" "$nall" "每个提交点都对应一条封存"
+# 8.2 正常历史核验通过，回溯行可信
+latest=$(api /api/points | jq -r '.points[-1].lsn')
+check "$(api "/api/verify?point=$latest" | jq -r .status)" "VERIFIED" "未篡改时网页核验通过"
+check "$(api "/api/verify?point=$latest" | jq '[.artifacts[]|select(.trust!="TRUSTED")]|length')" "0" \
+      "核验通过时回溯结果全部可信"
+check "$(api "/api/history/1001" | jq -r '.history[-1].trust')" "TRUSTED" "单编号历史带可信标记"
+# 8.3 再写一笔事务并核验，确认链持续延伸
+curl -s -X POST "$BASE/api/source/operations" -H 'Content-Type: application/json' -d "{
+ \"operations\":[{\"op\":\"insert\",\"artifact_no\":4001,\"service_name\":\"seal-svc\",\"version\":\"1\",\"sha256\":\"$SHA64\"}]}" >/dev/null
+sleep 2
+latest=$(api /api/points | jq -r '.points[-1].lsn')
+check "$(api "/api/verify?point=$latest" | jq -r .status)" "VERIFIED" "新事务封存后链仍完整"
+new_n=$(api /api/progress | jq -r '.seal.seal_count')
+[ "$new_n" -gt "$seal_n" ] && ok "封存链随事务连续延伸（$seal_n -> $new_n）" || bad "封存链未延伸"
+seqs=$(python3 -c "
+import sqlite3,sys
+c=sqlite3.connect('$SQLDIR/history.db')
+print(','.join(str(r[0]) for r in c.execute('select seq from seals order by seq')))")
+case "$seqs" in 0,1,2*|0,1,2) ok "封存序号从 GENESIS=0 连续: $seqs" ;; *) bad "封存序号不连续: $seqs" ;; esac
+
+# 8.4 强杀重启：封存不重复、链仍可核验（不漏封/不重封）
+force_kill_app
+start_app "$SQLDIR"
+wait_phase STREAMING 15 || true
+sleep 3
+seals_after=$(api /api/progress | jq -r '.seal.seal_count')
+check "$seals_after" "$new_n" "强杀重启后封存记录不重复（不重封）"
+check "$(api "/api/verify?point=$latest" | jq -r .status)" "VERIFIED" "强杀重启后核验仍通过"
+
+# 8.5 篡改检测：改值 / 缺行 / 删封存（乱序），均指出最早失效事务并标不可信
+db="$SQLDIR/history.db"
+# 8.5a 改值：把某条 TXN 封存覆盖的历史行版本改掉（先备份，可精确还原）
+victim_seq=$(python3 -c "
+import sqlite3
+c=sqlite3.connect('$db')
+print(c.execute(\"select min(seq) from seals where kind='TXN'\").fetchone()[0])")
+python3 - "$db" "$victim_seq" <<'PY'
+import sqlite3, sys
+db, seq = sys.argv[1], int(sys.argv[2])
+c = sqlite3.connect(db)
+c.execute("CREATE TABLE _selftest_backup AS SELECT * FROM artifact_history WHERE seal_seq=?", (seq,))
+c.execute("update artifact_history set version='TAMPERED' where seal_seq=?", (seq,))
+c.commit()
+PY
+v=$(api "/api/verify?point=$latest")
+check "$(echo "$v" | jq -r .status)" "INVALID" "改值后核验失败"
+check "$(echo "$v" | jq -r .first_invalid_seq)" "$victim_seq" "指出最早失效事务 seq=$victim_seq"
+check "$(echo "$v" | jq -r .first_invalid_reason)" "ENTRY_HASH_MISMATCH" "改值识别为摘要不一致"
+untrusted=$(echo "$v" | jq '[.artifacts[]|select(.trust=="UNTRUSTED")]|length')
+[ "$untrusted" -ge 1 ] && ok "受影响回溯结果标为不可信（$untrusted 行）" || bad "未标记不可信"
+good=$(echo "$v" | jq '[.artifacts[]|select(.trust=="TRUSTED")]|length')
+[ "$good" -ge 1 ] && ok "失效点之前的回溯仍可信（$good 行）" || bad "失效点前记录被误伤"
+# 从备份精确还原，链必须恢复 VERIFIED
+python3 - "$db" "$victim_seq" <<'PY'
+import sqlite3, sys
+db, seq = sys.argv[1], int(sys.argv[2])
+c = sqlite3.connect(db)
+c.execute("UPDATE artifact_history SET version=(SELECT version FROM _selftest_backup b"
+          " WHERE b.id=artifact_history.id) WHERE seal_seq=?", (seq,))
+c.execute("DROP TABLE _selftest_backup")
+c.commit()
+PY
+check "$(api "/api/verify?point=$latest" | jq -r .status)" "VERIFIED" "精确还原改值后核验恢复通过"
+
+# 8.5b 缺行：删除某封存下的一条历史行（备份后可插回，保持与下个场景独立）
+python3 - "$db" "$victim_seq" <<'PY'
+import sqlite3, sys
+db, seq = sys.argv[1], int(sys.argv[2])
+c = sqlite3.connect(db)
+c.execute("CREATE TABLE _selftest_backup AS SELECT * FROM artifact_history WHERE id IN ("
+          " SELECT id FROM artifact_history WHERE seal_seq=? ORDER BY id LIMIT 1)", (seq,))
+c.execute("DELETE FROM artifact_history WHERE id IN ("
+          " SELECT id FROM artifact_history WHERE seal_seq=? ORDER BY id LIMIT 1)", (seq,))
+c.commit()
+PY
+v=$(api "/api/verify?point=$latest")
+check "$(echo "$v" | jq -r .status)" "INVALID" "缺行后核验失败"
+check "$(echo "$v" | jq -r .first_invalid_reason)" "ROW_COUNT_MISMATCH" "缺行识别为行数不一致"
+check "$(echo "$v" | jq -r .first_invalid_seq)" "$victim_seq" "缺行定位到最早失效事务"
+# 插回被删行（显式原 id），链恢复
+python3 - "$db" <<'PY'
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+cols = [r[1] for r in c.execute("PRAGMA table_info(_selftest_backup)")]
+ph = ",".join("?" for _ in cols)
+for row in c.execute(f"SELECT {','.join(cols)} FROM _selftest_backup"):
+    c.execute(f"INSERT INTO artifact_history({','.join(cols)}) VALUES({ph})", row)
+c.execute("DROP TABLE _selftest_backup")
+c.commit()
+PY
+check "$(api "/api/verify?point=$latest" | jq -r .status)" "VERIFIED" "插回缺行后核验恢复通过"
+
+# 8.5c 乱序/删封存：删除中间封存制造 seq 空洞与断链
+mid_seq=$(python3 -c "
+import sqlite3
+c=sqlite3.connect('$db')
+rows=[r[0] for r in c.execute(\"select seq from seals where kind='TXN' order by seq\")]
+print(rows[1] if len(rows) > 1 else rows[0])")
+python3 - "$db" "$mid_seq" <<'PY'
+import sqlite3, sys
+db, seq = sys.argv[1], int(sys.argv[2])
+c = sqlite3.connect(db)
+c.execute("delete from seals where seq=?", (seq,))
+c.commit()
+PY
+v=$(api "/api/verify?point=$latest")
+check "$(echo "$v" | jq -r .status)" "INVALID" "删除封存后核验失败"
+echo "$v" | jq -e '.first_invalid_reason=="SEQ_GAP" or .first_invalid_reason=="CHAIN_BROKEN"' >/dev/null \
+  && ok "删封存识别为序列空洞/断链: $(echo "$v" | jq -r .first_invalid_reason)" \
+  || bad "删封存原因异常: $(echo "$v" | jq -r .first_invalid_reason)"
+
+# 8.6 核验为只读，捕获仍在继续：核验后再写事务仍可被捕获
+curl -s -X POST "$BASE/api/source/operations" -H 'Content-Type: application/json' -d "{
+ \"operations\":[{\"op\":\"insert\",\"artifact_no\":4002,\"service_name\":\"live-svc\",\"version\":\"1\",\"sha256\":\"$SHA64\"}]}" >/dev/null
+sleep 2
+check "$(api /api/history/4002 | jq '[.history[]|select(.change_type=="INSERT")]|length')" "1" \
+      "核验期间捕获继续，新事务未被阻断"
+
+# 8.7 旧库首次启用封存：全新目录 + 旧版本库（无 seals 表）启动后旧记录真实性未知
+echo "--- 8.7 旧库升级：启用前真实性未知 ---"
+stop_app; sleep 1
+LEGACY_DIR=/tmp/selftest-legacy-sqlite
+rm -rf "$LEGACY_DIR"; mkdir -p "$LEGACY_DIR"
+python3 - "$LEGACY_DIR/history.db" <<'PY'
+import sqlite3, sys
+sha = "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90"
+c = sqlite3.connect(sys.argv[1])
+c.executescript(f"""
+CREATE TABLE capture_state(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+INSERT INTO capture_state VALUES('phase','INITIALIZING');
+INSERT INTO capture_state VALUES('slot_name','artifacts_history_slot');
+INSERT INTO capture_state VALUES('baseline_lsn','0/1000');
+INSERT INTO capture_state VALUES('baseline_lsn_num','4096');
+CREATE TABLE txns(xid INTEGER PRIMARY KEY, commit_lsn TEXT NOT NULL,
+                  commit_lsn_num INTEGER NOT NULL, commit_ts TEXT);
+CREATE TABLE artifact_history(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, artifact_no INTEGER NOT NULL,
+  change_type TEXT NOT NULL, service_name TEXT, version TEXT, sha256 TEXT,
+  xid INTEGER, commit_lsn TEXT, commit_lsn_num INTEGER, captured_at TEXT NOT NULL);
+INSERT INTO artifact_history(artifact_no,change_type,service_name,version,sha256,
+  xid,commit_lsn,commit_lsn_num,captured_at)
+VALUES (7001,'BASELINE','legacy','1.0','{sha}',NULL,'0/1000',4096,'t0');
+""")
+c.commit()
+PY
+# 旧库已带基线，应用走 resume 分支：确保源库复制槽存在（不存在则补建）
+psql -h "$PGSOCK" -p "$PGPORT" -U postgres -tAc \
+  "select pg_create_logical_replication_slot('artifacts_history_slot','test_decoding')" 2>/dev/null || true
+# 旧库已有基线状态，应用走 resume 分支直接 STREAMING 并在构造时补 GENESIS
+PG_DSN="$DSN" SQLITE_PATH="$LEGACY_DIR/history.db" \
+  setsid nohup python3 -m uvicorn app.main:app --host 127.0.0.1 \
+  --port "$APPPORT" > /tmp/selftest-app.log 2>&1 < /dev/null &
+echo "$!" > /tmp/selftest-app.pid
+_wait_app_ready "$!" || bad "旧库升级场景应用启动失败"
+wait_phase STREAMING 15 || true
+check "$(api /api/progress | jq -r '.seal.enabled')" "true" "旧库启动后自动启用封存"
+check "$(api /api/progress | jq -r '.seal.legacy_upgrade')" "true" "标记为旧库首次启用封存"
+v=$(api "/api/verify")
+check "$(echo "$v" | jq -r .status)" "VERIFIED" "旧库封存链可复算通过（仅证明启用后未变）"
+check "$(echo "$v" | jq -r '.seal_genesis.legacy_upgrade')" "true" "核验结果暴露封存起点为旧库升级"
+check "$(api /api/history/7001 | jq -r '.history[0].trust')" "UNKNOWN" "启用前旧记录真实性标为未知"
+curl -s -X POST "$BASE/api/source/operations" -H 'Content-Type: application/json' -d "{
+ \"operations\":[{\"op\":\"insert\",\"artifact_no\":7002,\"service_name\":\"post-seal\",\"version\":\"1\",\"sha256\":\"$SHA64\"}]}" >/dev/null
+sleep 2
+check "$(api /api/history/7002 | jq -r '.history[0].trust')" "TRUSTED" "启用后新事务封存记录可信"
+
 echo
 echo "================ 自测结果: $PASS passed / $FAIL failed ================"
 [ "$FAIL" -eq 0 ]
